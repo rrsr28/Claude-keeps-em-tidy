@@ -1,0 +1,255 @@
+name: Claude PR Assistant
+on:
+  # Automatic review on PR open or update
+  pull_request:
+    types: [opened, synchronize]
+
+  # Manual trigger via @claude in comments or reviews
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  # Job 1: Automatic PR Review
+  code-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load Review Rules
+        id: load-rules
+        run: |
+          echo "RULES<<EOF" >> $GITHUB_ENV
+          cat agent.md >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Run Code Review with Claude
+        id: code-review
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          model: "claude-sonnet-4-20250514"
+          prompt: |
+            ${{ env.RULES }}
+
+            Review this pull request and evaluate it against the rules above.
+
+            First, run `git diff --name-only HEAD~1` and `git diff HEAD~1` to understand what changed.
+            Then start with a short summary of what this PR is doing.
+            Then, classify the risk of this PR as either **low** or **high**, and explain why.
+            Finally, review the code changes with specific suggestions for improvement.
+            If any of the rules listed above are **not followed**, call them out clearly and suggest what should be changed to comply.
+            
+            Use inline comments to highlight specific areas of concern.
+            You may refer to unchanged files **only if needed to understand the logic or context** behind the changes.
+            But **do not** comment on or review unrelated code that was not modified in this PR. Focus only on the changes made in this PR.
+            Structure your response in markdown.
+          allowed_tools: "Bash(git diff --name-only HEAD~1),Bash(git diff HEAD~1),View,GlobTool,GrepTool"
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "30"
+      
+      - name: Extract and Comment PR Review with Usage Details
+        if: steps.code-review.outputs.conclusion == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            
+            // Constants
+            const COST_PRECISION = 4;
+            const DURATION_PRECISION = 2;
+            const DEFAULT_MODEL = 'claude-sonnet-4';
+            const ERROR_MESSAGES = {
+              JSON_PARSE: '⚠️ Claude review could not be parsed due to JSON error. Please re-run the workflow or check the Claude output file.',
+              EMPTY_LOG: '⚠️ Claude output is empty or not structured correctly. Please check if Claude ran successfully.',
+              NO_REVIEW: '⚠️ Claude ran, but did not return any review comments. Please verify if the PR contains code changes or if rules were met.'
+            };
+            
+            // Helper function to safely parse JSON
+            function parseExecutionLog(filePath) {
+              try {
+                const fileContents = fs.readFileSync(filePath, 'utf8');
+                return JSON.parse(fileContents);
+              } catch (error) {
+                throw new Error(`Failed to parse execution log: ${error.message}`);
+              }
+            }
+            
+            // Helper function to extract review content
+            function extractReviewContent(executionLog) {
+              for (let i = executionLog.length - 1; i >= 0; i--) {
+                const entry = executionLog[i];
+                if (entry.type === 'assistant' && entry.message?.role === 'assistant') {
+                  const contentBlocks = entry.message.content;
+                  if (Array.isArray(contentBlocks)) {
+                    return contentBlocks
+                      .filter(block => block.type === 'text')
+                      .map(block => block.text)
+                      .join('\n\n');
+                  }
+                }
+              }
+              return '';
+            }
+            
+            // Helper function to extract usage data
+            function extractUsageData(executionLog) {
+              let latestUsage = null;
+              let modelUsed = '';
+              let totalDuration = 0;
+              let actualCost = 0;
+              
+              // Get the latest assistant message with usage data
+              for (let i = executionLog.length - 1; i >= 0; i--) {
+                const entry = executionLog[i];
+                if (entry.type === 'assistant' && entry.message?.usage) {
+                  latestUsage = entry.message.usage;
+                  modelUsed = entry.message.model || '';
+                  break;
+                }
+              }
+              
+              // Get final result information
+              const resultEntry = executionLog.find(entry => entry.type === 'result');
+              if (resultEntry) {
+                actualCost = resultEntry.cost_usd || resultEntry.total_cost || 0;
+                totalDuration = resultEntry.duration_ms || 0;
+              }
+              
+              return { latestUsage, modelUsed, totalDuration, actualCost };
+            }
+            
+            // Helper function to format usage metrics
+            function formatUsageMetrics(latestUsage, totalDuration) {
+              const inputTokens = latestUsage.input_tokens || 0;
+              const outputTokens = latestUsage.output_tokens || 0;
+              const cacheReadTokens = latestUsage.cache_read_input_tokens || 0;
+              const cacheCreationTokens = latestUsage.cache_creation_input_tokens || 0;
+              const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheCreationTokens;
+              const durationSeconds = totalDuration > 0 ? (totalDuration / 1000).toFixed(DURATION_PRECISION) : '0.00';
+              
+              return {
+                inputTokens,
+                outputTokens,
+                cacheReadTokens,
+                cacheCreationTokens,
+                totalTokens,
+                durationSeconds
+              };
+            }
+            
+            // Helper function to build usage table (now collapsible)
+            function buildUsageTable(metrics, modelUsed, actualCost) {
+              const { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, totalTokens, durationSeconds } = metrics;
+              
+              let usageTable = `
+            
+            ---
+            
+            <details>
+            <summary>📊 Usage Details</summary>
+            
+            | Metric | Value |
+            |--------|-------|
+            | **Model** | ${modelUsed || DEFAULT_MODEL} |
+            | **Input Tokens** | ${inputTokens.toLocaleString()} |
+            | **Output Tokens** | ${outputTokens.toLocaleString()} |
+            | **Cache Read Tokens** | ${cacheReadTokens.toLocaleString()} |
+            | **Cache Creation Tokens** | ${cacheCreationTokens.toLocaleString()} |
+            | **Total Tokens** | ${totalTokens.toLocaleString()} |
+            | **Duration** | ${durationSeconds}s |`;
+              
+              if (actualCost > 0) {
+                usageTable += `
+            | **Cost** | ${actualCost.toFixed(COST_PRECISION)} |`;
+              }
+              
+              return usageTable + '\n\n</details>\n\n';
+            }
+            
+            // Helper function to create usage summary
+            function createUsageSummary(usageData) {
+              const { latestUsage, modelUsed, totalDuration, actualCost } = usageData;
+              
+              if (!latestUsage) return '';
+              
+              const metrics = formatUsageMetrics(latestUsage, totalDuration);
+              return buildUsageTable(metrics, modelUsed, actualCost);
+            }
+            
+            // Helper function to post comment
+            async function postComment(body) {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            }
+            
+            // Main execution
+            const executionFile = '${{ steps.code-review.outputs.execution_file }}';
+            
+            try {
+              const executionLog = parseExecutionLog(executionFile);
+              
+              if (!Array.isArray(executionLog) || executionLog.length === 0) {
+                await postComment(ERROR_MESSAGES.EMPTY_LOG);
+                return;
+              }
+              
+              const review = extractReviewContent(executionLog);
+              const usageData = extractUsageData(executionLog);
+              const usageSummary = createUsageSummary(usageData);
+              
+              const finalComment = review?.trim() 
+                ? review + usageSummary
+                : ERROR_MESSAGES.NO_REVIEW + usageSummary;
+                
+              await postComment(finalComment);
+              
+            } catch (error) {
+              await postComment(ERROR_MESSAGES.JSON_PARSE);
+            }
+            
+  # Job 2: Manual Claude trigger via @claude
+  claude-code-action:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Run Claude PR Action
+        id: claude-action
+        uses: anthropics/claude-code-action@beta
+        with:
+          model: "claude-sonnet-4-20250514"
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: "30"
+            
