@@ -1,0 +1,276 @@
+name: Weekly README Update
+on:
+  schedule:
+    # Every Monday at 12:30 AM UTC
+    - cron: '30 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force update even if no changes'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  
+jobs:
+  update-readme:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Get current datetime for branch
+        id: datetime
+        run: echo "datetime=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+      
+      - name: Analyze weekly changes
+        id: changes
+        run: |
+          LAST_WEEK=$(date -d '7 days ago' '+%Y-%m-%d')
+          LAST_WEEK_ISO=$(date -d '7 days ago' --iso-8601)
+          CURRENT_DATE=$(date --iso-8601)
+          
+          # Count commits from last week
+          COMMIT_COUNT=$(git rev-list --count --since="$LAST_WEEK" HEAD)
+          echo "commits=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          echo "last_week=$LAST_WEEK" >> $GITHUB_OUTPUT
+          echo "last_week_iso=$LAST_WEEK_ISO" >> $GITHUB_OUTPUT
+          echo "current_date=$CURRENT_DATE" >> $GITHUB_OUTPUT
+          
+          # Get the commit hash from a week ago for proper diff comparison
+          WEEK_AGO_COMMIT=$(git rev-list -1 --before="$LAST_WEEK" HEAD 2>/dev/null || echo "")
+          
+          # Generate detailed analysis files
+          echo "=== COMMITS FROM $LAST_WEEK_ISO TO $CURRENT_DATE ===" > /tmp/detailed_analysis.txt
+          git log --since="$LAST_WEEK" --pretty=format:"📝 %h - %s (%an, %ad)" --date=short >> /tmp/detailed_analysis.txt
+          echo -e "\n\n=== FILES CHANGED ===" >> /tmp/detailed_analysis.txt
+          
+          # Fixed: Use proper git diff syntax with commit ranges
+          if [[ -n "$WEEK_AGO_COMMIT" ]]; then
+            git diff --name-status "$WEEK_AGO_COMMIT"..HEAD >> /tmp/detailed_analysis.txt
+            echo -e "\n\n=== CHANGE SUMMARY ===" >> /tmp/detailed_analysis.txt
+            git diff --stat "$WEEK_AGO_COMMIT"..HEAD >> /tmp/detailed_analysis.txt
+            
+            # Generate individual analysis files for Claude
+            git diff --name-only "$WEEK_AGO_COMMIT"..HEAD > /tmp/changed_files.txt
+            git diff "$WEEK_AGO_COMMIT"..HEAD --output=/tmp/weekly_changes.diff
+            
+            # Store stats for PR description
+            CHANGED_FILES=$(wc -l < /tmp/changed_files.txt)
+            ADDITIONS=$(git diff --numstat "$WEEK_AGO_COMMIT"..HEAD | awk '{add+=$1} END {print add+0}')
+            DELETIONS=$(git diff --numstat "$WEEK_AGO_COMMIT"..HEAD | awk '{del+=$2} END {print del+0}')
+          else
+            # Fallback: compare against empty tree if no commit found from a week ago
+            echo "No commit found from a week ago, using all recent commits" >> /tmp/detailed_analysis.txt
+            git log --since="$LAST_WEEK" --name-status --pretty=format:"" | grep -E '^[AMDRT]' | sort -u >> /tmp/detailed_analysis.txt
+            echo -e "\n\n=== CHANGE SUMMARY ===" >> /tmp/detailed_analysis.txt
+            echo "Recent commits (no baseline for diff)" >> /tmp/detailed_analysis.txt
+            
+            # Generate files for recent commits only
+            git log --since="$LAST_WEEK" --name-only --pretty=format:"" | grep -v '^$' | sort -u > /tmp/changed_files.txt
+            echo "# No diff available - repository too new or no commits from baseline" > /tmp/weekly_changes.diff
+            
+            CHANGED_FILES=$(wc -l < /tmp/changed_files.txt)
+            ADDITIONS="N/A"
+            DELETIONS="N/A"
+          fi
+          
+          git log --since="$LAST_WEEK" --pretty=format:"%h %s by %an (%ad)" --date=short > /tmp/recent_commits.txt
+          
+          # Copy to workspace for Claude (these won't be committed)
+          cp /tmp/changed_files.txt ./changed_files_temp.txt
+          cp /tmp/weekly_changes.diff ./weekly_changes_temp.diff
+          cp /tmp/recent_commits.txt ./recent_commits_temp.txt
+          cp /tmp/detailed_analysis.txt ./detailed_analysis_temp.txt
+          
+          echo "changed_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "additions=$ADDITIONS" >> $GITHUB_OUTPUT
+          echo "deletions=$DELETIONS" >> $GITHUB_OUTPUT
+          
+          echo "📊 Analysis complete: $COMMIT_COUNT commits, $CHANGED_FILES files, +$ADDITIONS/-$DELETIONS lines"
+      
+      - name: Skip if no changes
+        if: steps.changes.outputs.commits == '0' && github.event.inputs.force_update != 'true'
+        run: |
+          echo "ℹ️ No commits in the last week. Skipping update."
+          exit 0
+      
+      - name: Update README with Claude Code
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_model: "claude-sonnet-4-20250514"
+          allowed_tools: "View,Edit,Bash(git:*),Bash(git config*),Bash(git checkout*),Bash(git branch*),Bash(git status),Bash(git log*),Bash(git diff*),Bash(git rev-list*),Bash(git add*),Bash(git commit*),Bash(git push*),Bash(echo*),Bash(wc*),Bash(cat*),Bash(head*),Bash(tail*)"
+          prompt: |
+            I need you to analyze the code changes from the last 7 days (${{ steps.changes.outputs.last_week_iso }} to ${{ steps.changes.outputs.current_date }}) and update the README.md file with precise, meaningful updates.
+            ## CHANGE ANALYSIS SUMMARY
+            - **Commits analyzed:** ${{ steps.changes.outputs.commits }} commits
+            - **Files changed:** ${{ steps.changes.outputs.changed_files }} files  
+            - **Code changes:** +${{ steps.changes.outputs.additions }}/-${{ steps.changes.outputs.deletions }} lines
+            - **Analysis period:** ${{ steps.changes.outputs.last_week_iso }} to ${{ steps.changes.outputs.current_date }}
+            
+            ## AVAILABLE DATA SOURCES
+            You have access to these analysis files (check if they exist and have content):
+            
+            1. **`detailed_analysis_temp.txt`** - Complete analysis with commits, files, and stats
+            2. **`weekly_changes_temp.diff`** - Full git diff showing exact code changes
+            3. **`recent_commits_temp.txt`** - Commit messages with authors and dates
+            4. **`changed_files_temp.txt`** - List of all modified files
+            
+            ## STEP-BY-STEP INSTRUCTIONS
+            
+            ### 1. VERIFY DATA SOURCES
+            Check each analysis file exists and contains data. If missing, use git fallback:
+            ```bash
+            git log --oneline --since="${{ steps.changes.outputs.last_week }}"
+            git diff --name-only HEAD~7..HEAD  # Alternative approach for file changes
+            git diff --stat HEAD~7..HEAD      # Alternative approach for stats
+            ```
+            
+            ### 2. ANALYZE CURRENT README
+            - Read README.md thoroughly to understand structure, tone, and existing content
+            - Identify sections: installation, usage, API, examples, changelog, etc.
+            - Note the documentation style and formatting conventions
+            
+            ### 3. UPDATE STRATEGICALLY
+            
+            **Core Principles:**
+            - Only update sections that correspond to actual functional changes
+            - Preserve existing structure and tone
+            - Be specific and accurate - base everything on actual code analysis
+            - Add concrete, working examples for new features
+            - Update version info to reflect current state
+            
+            ### 4. GENERATE CHANGE SUMMARY
+            At the end of your work, create a file called `readme_changes_summary.txt` with:
+            ```
+            WHAT CHANGED:
+            - [Specific section] updated because [specific code change]
+            - [Another section] added because [new feature/API]
+            
+            WHY CHANGED:
+            - [Reason 1]: [Code change] required documentation update
+            - [Reason 2]: [New feature] needed usage examples
+            
+            IMPACT:
+            - Users can now [specific benefit]
+            - Developers will notice [specific improvement]
+            ```
+            
+            ## FALLBACK STRATEGIES
+            - **No analysis files:** Use git commands directly
+            - **Empty diffs:** Just update timestamp and note "maintenance updates"
+            - **Too many changes:** Focus on user-facing changes first
+            - **Unclear changes:** Be conservative, only update what you're certain about
+            
+            ## COMPLETION CHECKLIST
+            - [ ] All updates are technically accurate
+            - [ ] Code examples are functional
+            - [ ] No outdated information remains
+            - [ ] Formatting is consistent
+            - [ ] Change summary file created
+            - [ ] Only README.md was modified
+            
+            **Start by checking your data sources, then analyze and update systematically.**
+      
+      - name: Check if README was modified
+        id: readme_check
+        run: |
+          if [[ -n $(git status --porcelain README.md) ]]; then
+            echo "readme_changed=true" >> $GITHUB_OUTPUT
+            echo "✅ README.md has been modified"
+            
+            # Capture the summary if Claude created it
+            if [[ -f readme_changes_summary.txt ]]; then
+              CHANGE_SUMMARY=$(cat readme_changes_summary.txt | sed ':a;N;$!ba;s/\n/\\n/g')
+              echo "CHANGE_SUMMARY=$CHANGE_SUMMARY" >> $GITHUB_OUTPUT
+              echo "=== CHANGE SUMMARY ==="
+              cat readme_changes_summary.txt
+            else
+              echo "CHANGE_SUMMARY=Claude updated README.md based on weekly code analysis" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "readme_changed=false" >> $GITHUB_OUTPUT
+            echo "README.md was not modified"
+            echo "CHANGE_SUMMARY=No documentation updates needed" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create Pull Request
+        if: steps.readme_check.outputs.readme_changed == 'true'
+        run: |
+          # Configure git for the bot
+          git config --local user.email "claude-bot@users.noreply.github.com"
+          git config --local user.name "Claude README Bot"
+          
+          # Create and switch to new branch
+          BRANCH_NAME="readme-update-${{ steps.datetime.outputs.datetime }}"
+          git checkout -b "$BRANCH_NAME"
+          
+          # Add and commit only the README
+          git add README.md
+          
+          # Create detailed commit message
+          COMMIT_MSG="docs: weekly README update - analyzed ${{ steps.changes.outputs.commits }} commits
+          📅 Generated: $(date +'%Y-%m-%d %H:%M UTC')"
+          
+          git commit -m "$COMMIT_MSG"
+          
+          # Push the branch
+          git push origin "$BRANCH_NAME"
+          
+          # Create detailed PR using GitHub CLI
+          CURRENT_DATE=$(date +'%Y-%m-%d %H:%M UTC')
+          
+          gh pr create \
+            --title "📚 Weekly README Update - ${{ steps.changes.outputs.current_date }}" \
+            --body "## 🤖 Automated Weekly README Update
+          ### 📊 Analysis Overview
+          - **Analysis Period:** ${{ steps.changes.outputs.last_week_iso }} → ${{ steps.changes.outputs.current_date }}
+          - **Commits Analyzed:** ${{ steps.changes.outputs.commits }}
+          - **Files Changed:** ${{ steps.changes.outputs.changed_files }}
+          - **Code Changes:** +${{ steps.changes.outputs.additions }}/-${{ steps.changes.outputs.deletions }} lines
+          - **Generated:** $CURRENT_DATE
+          - **Claude Model:** claude-sonnet-4-20250514
+          ### 📝 What Changed & Why
+          \`\`\`
+          $(cat readme_changes_summary.txt 2>/dev/null || echo "${{ steps.readme_check.outputs.CHANGE_SUMMARY }}")
+          \`\`\`
+         
+          **Branch:** \`readme-update-${{ steps.datetime.outputs.datetime }}\`
+          **Auto-assigned to:** @${{ github.repository_owner }}" \
+            --assignee "${{ github.repository_owner }}"
+          
+          echo "✅ Pull Request created successfully!"
+          echo "🌿 Branch: readme-update-${{ steps.datetime.outputs.datetime }}"
+          echo "📊 Analyzed ${{ steps.changes.outputs.commits }} commits from ${{ steps.changes.outputs.last_week_iso }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: No changes made
+        if: steps.readme_check.outputs.readme_changed == 'false'
+        run: |
+          echo "ℹ️ No README updates needed based on this week's code changes"
+          echo "📊 Analyzed ${{ steps.changes.outputs.commits }} commits from ${{ steps.changes.outputs.last_week_iso }}"
+          echo "🎯 No documentation updates required - code changes didn't affect user-facing functionality"
+      
+      - name: Clean up temporary files
+        if: always()
+        run: |
+          # Remove temporary analysis files (they should never be committed)
+          rm -f ./changed_files_temp.txt
+          rm -f ./weekly_changes_temp.diff  
+          rm -f ./recent_commits_temp.txt
+          rm -f ./detailed_analysis_temp.txt
+          rm -f ./readme_changes_summary.txt
+          rm -f /tmp/changed_files.txt
+          rm -f /tmp/weekly_changes.diff
+          rm -f /tmp/recent_commits.txt
+          rm -f /tmp/detailed_analysis.txt
+          echo "🧹 Temporary analysis files cleaned up"
